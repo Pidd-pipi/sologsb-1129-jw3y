@@ -9,9 +9,17 @@ import { useMatrixSearch } from '../hooks/useMatrixSearch';
 import { useCaseStore } from '../stores/caseStore';
 import { useUiStore } from '../stores/uiStore';
 import type { CaseKind, CaseSlot, TypeCase } from '../types/case';
-import { CASE_KINDS, COL_RANGE, ROW_RANGE, describeCapacity, validateCaseInput } from '../types/case';
+import {
+  CASE_KINDS,
+  COL_RANGE,
+  ROW_RANGE,
+  describeCapacity,
+  validateCaseInput,
+  validateLoanInput,
+  validateReturnInput,
+} from '../types/case';
 import type { TypeMatrix } from '../types/matrix';
-import { suggestCaseCode } from '../utils/format';
+import { formatDate, formatStamp, suggestCaseCode, todayStr } from '../utils/format';
 import { rcKey, slotAt, type RCCell } from '../utils/layout';
 
 /** 字盘列表 + 新建字盘 */
@@ -112,6 +120,14 @@ export default function CaseEditor() {
                       <span className="text-[11px] text-ink-mute">
                         {describeCapacity(c.rows, c.cols)} · 已落位 {c.slots.length} · {c.workStation}
                       </span>
+                      {c.loan ? (
+                        <span
+                          className="rounded border border-brass/50 bg-brass-pale px-1.5 py-0.5 text-[11px] text-brass"
+                          data-testid={`case-loan-${c.id}`}
+                        >
+                          借用中 · {c.loan.borrower} · 预计 {formatDate(c.loan.expectedReturn)} 归还
+                        </span>
+                      ) : null}
                     </button>
                   </li>
                 ))
@@ -232,12 +248,23 @@ interface PendingPlacement {
 
 function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
   const pushToast = useUiStore((s) => s.pushToast);
+  const lendCase = useCaseStore((s) => s.lendCase);
+  const returnCase = useCaseStore((s) => s.returnCase);
   const api = useCaseSlots(typeCase);
   const { results: candidateMatrices } = useMatrixSearch({ availability: ['可用'], ignoreKeyword: true });
   const [pickedChar, setPickedChar] = useState('');
   const [pending, setPending] = useState<PendingPlacement | null>(null);
   const [selectedKey, setSelectedKey] = useState('');
   const [swapFrom, setSwapFrom] = useState<RCCell | null>(null);
+  const [loanForm, setLoanForm] = useState({ borrower: '', contact: '', expectedReturn: '' });
+  const [loanErrors, setLoanErrors] = useState<Record<string, string>>({});
+  const [returnForm, setReturnForm] = useState({ actualCount: '', note: '' });
+  const [returnErrors, setReturnErrors] = useState<Record<string, string>>({});
+
+  /** 借用中：格位只读，任何改动都要被挡住 */
+  const loan = typeCase.loan ?? null;
+  const loaned = Boolean(loan);
+  const loanHistory = typeCase.loanHistory ?? [];
 
   const { draft, patch, reset: resetDraft } = useLocalDraft<{ slots: CaseSlot[] }>(
     DRAFT_KEYS.caseEditor(typeCase.id),
@@ -273,6 +300,10 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
   );
 
   const handleSlotClick = (row: number, col: number) => {
+    if (loaned) {
+      pushToast(`字盘 ${typeCase.code} 借用中，格位只读，归还前不能改动`, 'warn');
+      return;
+    }
     const key = rcKey(row, col);
     setSelectedKey(key);
     if (pending) {
@@ -307,6 +338,65 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
     }
   };
 
+  /** 借出登记：布局未保存或存在重复落位等冲突时先提示处理，不把有问题的字盘交出去 */
+  const handleLend = async (e: FormEvent) => {
+    e.preventDefault();
+    if (api.dirty) {
+      pushToast('当前布局尚未保存，请先「保存布局」或「撤回落库版本」再办理借出', 'warn');
+      return;
+    }
+    if (api.conflicts.hasConflict) {
+      pushToast('当前布局存在重复落位等冲突，请先处理干净再借出', 'warn');
+      return;
+    }
+    const errors = validateLoanInput(loanForm);
+    setLoanErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      pushToast('外借登记未通过校验，请按提示修正', 'warn');
+      return;
+    }
+    try {
+      await lendCase(typeCase.id, loanForm);
+      patch({ slots: typeCase.slots });
+      pushToast(`字盘 ${typeCase.code} 已借出给 ${loanForm.borrower.trim()}，格位已锁定为只读`);
+      setLoanForm({ borrower: '', contact: '', expectedReturn: '' });
+      setLoanErrors({});
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '借出登记失败', 'error');
+    }
+  };
+
+  /** 归还清点：账实不符记录差异说明并保持借用中，账实相符才恢复编辑 */
+  const handleReturn = async (e: FormEvent) => {
+    e.preventDefault();
+    const expected = typeCase.slots.length;
+    const errors = validateReturnInput(
+      { actualCount: returnForm.actualCount, note: returnForm.note },
+      expected,
+    );
+    setReturnErrors(errors);
+    if (Object.keys(errors).length > 0) {
+      pushToast('归还清点未通过校验，请按提示修正', 'warn');
+      return;
+    }
+    const input = { actualCount: Number(returnForm.actualCount), note: returnForm.note };
+    try {
+      const result = await returnCase(typeCase.id, input);
+      if (result.matched) {
+        pushToast(`账实相符（${expected} 枚），字盘 ${typeCase.code} 已归还入库，恢复编辑`);
+        setReturnForm({ actualCount: '', note: '' });
+      } else {
+        pushToast(
+          `账实不符：账面 ${expected} 枚、实还 ${input.actualCount} 枚，已记录差异说明，字盘继续保持借用中`,
+          'warn',
+        );
+      }
+      setReturnErrors({});
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '归还登记失败', 'error');
+    }
+  };
+
   return (
     <section className="space-y-3">
       <div className="mt-panel">
@@ -321,16 +411,29 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button type="button" className="mt-btn mt-btn-primary" data-testid="save-layout-btn" onClick={handleSave} disabled={api.saving}>
+            <button
+              type="button"
+              className="mt-btn mt-btn-primary"
+              data-testid="save-layout-btn"
+              onClick={handleSave}
+              disabled={api.saving || loaned}
+            >
               {api.saving ? '保存中…' : api.dirty ? '保存布局（有改动）' : '保存布局'}
             </button>
-            <button type="button" className="mt-btn" data-testid="revert-layout-btn" onClick={api.revert} disabled={!api.dirty}>
+            <button
+              type="button"
+              className="mt-btn"
+              data-testid="revert-layout-btn"
+              onClick={api.revert}
+              disabled={!api.dirty || loaned}
+            >
               撤回落库版本
             </button>
             <button
               type="button"
               className="mt-btn"
               data-testid="clear-grid-btn"
+              disabled={loaned}
               onClick={() => {
                 api.clear();
                 pushToast('已清空当前格位（尚未保存）', 'warn');
@@ -341,6 +444,16 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
           </div>
         </div>
 
+        {loaned && loan ? (
+          <div
+            className="mx-4 mt-3 rounded border border-brass/50 bg-brass-pale px-3 py-2 text-xs leading-relaxed text-brass"
+            data-testid="loan-banner"
+          >
+            借用中：{loan.borrower}（{loan.contact}）· {formatStamp(loan.lentAt)} 借出 · 预计{' '}
+            {formatDate(loan.expectedReturn)} 归还 · 账面 {loan.expectedCount} 枚。格位只供查看，归还清点账实相符后恢复编辑。
+          </div>
+        ) : null}
+
         <div className="grid grid-cols-1 gap-3 px-4 py-3 lg:grid-cols-[1fr_300px]">
           <div className="space-y-2">
             <LayoutGrid
@@ -350,6 +463,7 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
               highlight={selectedCell}
               conflictKeys={conflictKeys}
               pendingCharacter={pending?.matrix.character ?? ''}
+              readOnly={loaned}
               onSlotClick={handleSlotClick}
               testIdPrefix="case-slot"
             />
@@ -385,6 +499,169 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
           </div>
 
           <div className="space-y-3">
+            {loaned && loan ? (
+              <>
+                <div className="rounded border border-brass/40 bg-brass-pale/60 px-3 py-3" data-testid="loan-panel">
+                  <h4 className="mb-2 font-song text-sm font-semibold text-ink">外借信息</h4>
+                  <dl className="space-y-1 text-xs text-ink-soft">
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-ink-mute">借用人</dt>
+                      <dd data-testid="loan-borrower">{loan.borrower}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-ink-mute">联系方式</dt>
+                      <dd data-testid="loan-contact">{loan.contact}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-ink-mute">借出时间</dt>
+                      <dd>{formatStamp(loan.lentAt)}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-ink-mute">预计归还</dt>
+                      <dd data-testid="loan-expected">{formatDate(loan.expectedReturn)}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-ink-mute">账面枚数</dt>
+                      <dd>{typeCase.slots.length} 枚</dd>
+                    </div>
+                  </dl>
+                </div>
+
+                <form
+                  className="space-y-2 rounded border border-paper-line bg-white/70 px-3 py-3"
+                  onSubmit={handleReturn}
+                  data-testid="return-form"
+                >
+                  <h4 className="font-song text-sm font-semibold text-ink">归还清点</h4>
+                  <p className="text-[11px] text-ink-mute">
+                    账面应还 {typeCase.slots.length} 枚；实还与账面不一致时需填写差异说明，字盘继续保持借用中。
+                  </p>
+                  <div>
+                    <label className="mt-label" htmlFor="return-count-input">
+                      实际枚数
+                    </label>
+                    <input
+                      id="return-count-input"
+                      data-testid="return-count-input"
+                      className="mt-input"
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={returnForm.actualCount}
+                      onChange={(e) => setReturnForm((p) => ({ ...p, actualCount: e.target.value }))}
+                    />
+                    {returnErrors.actualCount ? (
+                      <p className="mt-error" data-testid="error-return-count">
+                        {returnErrors.actualCount}
+                      </p>
+                    ) : null}
+                  </div>
+                  <div>
+                    <label className="mt-label" htmlFor="return-note-input">
+                      差异说明（账实不符时必填）
+                    </label>
+                    <input
+                      id="return-note-input"
+                      data-testid="return-note-input"
+                      className="mt-input"
+                      placeholder="例：短缺 2 枚，已联系借用人补办手续"
+                      value={returnForm.note}
+                      onChange={(e) => setReturnForm((p) => ({ ...p, note: e.target.value }))}
+                    />
+                    {returnErrors.note ? (
+                      <p className="mt-error" data-testid="error-return-note">
+                        {returnErrors.note}
+                      </p>
+                    ) : null}
+                  </div>
+                  <button type="submit" className="mt-btn mt-btn-primary" data-testid="return-case-btn">
+                    登记归还
+                  </button>
+                </form>
+
+                {loan.returns.length > 0 ? (
+                  <div className="rounded border border-paper-line bg-white/70 px-3 py-3" data-testid="return-entries">
+                    <h4 className="mb-2 font-song text-sm font-semibold text-ink">清点记录</h4>
+                    <ul className="space-y-1 text-xs text-ink-soft">
+                      {loan.returns.map((r, i) => (
+                        <li key={r.returnedAt} data-testid={`return-entry-${i}`}>
+                          {formatStamp(r.returnedAt)} · 实还 {r.actualCount} / 账面 {r.expectedCount} 枚 ·{' '}
+                          {r.matched ? '账实相符' : `差异：${r.note}`}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <div className="rounded border border-paper-line bg-white/70 px-3 py-3" data-testid="loan-panel">
+                  <h4 className="mb-2 font-song text-sm font-semibold text-ink">外借登记（借给外单位展陈）</h4>
+                  <form className="space-y-2" onSubmit={handleLend} data-testid="loan-form">
+                    <div>
+                      <label className="mt-label" htmlFor="loan-borrower-input">
+                        借用人
+                      </label>
+                      <input
+                        id="loan-borrower-input"
+                        data-testid="loan-borrower-input"
+                        className="mt-input"
+                        placeholder="例：市印刷博物馆 王老师"
+                        value={loanForm.borrower}
+                        onChange={(e) => setLoanForm((p) => ({ ...p, borrower: e.target.value }))}
+                      />
+                      {loanErrors.borrower ? (
+                        <p className="mt-error" data-testid="error-loan-borrower">
+                          {loanErrors.borrower}
+                        </p>
+                      ) : null}
+                    </div>
+                    <div>
+                      <label className="mt-label" htmlFor="loan-contact-input">
+                        联系方式
+                      </label>
+                      <input
+                        id="loan-contact-input"
+                        data-testid="loan-contact-input"
+                        className="mt-input"
+                        placeholder="例：138-xxxx-xxxx"
+                        value={loanForm.contact}
+                        onChange={(e) => setLoanForm((p) => ({ ...p, contact: e.target.value }))}
+                      />
+                      {loanErrors.contact ? (
+                        <p className="mt-error" data-testid="error-loan-contact">
+                          {loanErrors.contact}
+                        </p>
+                      ) : null}
+                    </div>
+                    <div>
+                      <label className="mt-label" htmlFor="loan-expected-input">
+                        预计归还日
+                      </label>
+                      <input
+                        id="loan-expected-input"
+                        data-testid="loan-expected-input"
+                        className="mt-input"
+                        type="date"
+                        min={todayStr()}
+                        value={loanForm.expectedReturn}
+                        onChange={(e) => setLoanForm((p) => ({ ...p, expectedReturn: e.target.value }))}
+                      />
+                      {loanErrors.expectedReturn ? (
+                        <p className="mt-error" data-testid="error-loan-expected">
+                          {loanErrors.expectedReturn}
+                        </p>
+                      ) : null}
+                    </div>
+                    <button type="submit" className="mt-btn mt-btn-primary" data-testid="lend-case-btn">
+                      登记借出
+                    </button>
+                    <p className="text-[11px] text-ink-mute">
+                      借出前自动检查：布局未保存或存在重复落位时需先处理；借出后格位只读，归还清点账实相符后恢复编辑。
+                    </p>
+                  </form>
+                </div>
+
             <div className="rounded border border-paper-line bg-white/70 px-3 py-3">
               <h4 className="mb-2 font-song text-sm font-semibold text-ink">落位操作</h4>
               <CharacterPicker
@@ -522,6 +799,27 @@ function CaseLayoutEditor({ typeCase }: { typeCase: TypeCase }) {
             <Link className="mt-btn block text-center" to="/defects" data-testid="goto-defects">
               去登记缺损 / 补刻
             </Link>
+              </>
+            )}
+
+            {loanHistory.length > 0 ? (
+              <div className="rounded border border-paper-line bg-white/70 px-3 py-3" data-testid="loan-history">
+                <h4 className="mb-2 font-song text-sm font-semibold text-ink">外借记录</h4>
+                <ul className="space-y-1 text-xs text-ink-soft">
+                  {loanHistory.map((h, i) => {
+                    const last = h.returns[h.returns.length - 1];
+                    const hadDiff = h.returns.some((r) => !r.matched);
+                    return (
+                      <li key={`${h.lentAt}-${i}`} data-testid={`loan-history-${i}`}>
+                        {h.borrower} · {formatStamp(h.lentAt)} 借出 ·{' '}
+                        {last ? `${formatStamp(last.returnedAt)} 归还（实还 ${last.actualCount} 枚）` : '归还时间缺失'}
+                        {hadDiff ? ' · 曾有账实差异' : ''}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ) : null}
           </div>
         </div>
       </div>

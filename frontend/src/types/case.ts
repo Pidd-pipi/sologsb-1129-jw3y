@@ -18,6 +18,36 @@ export interface CaseSlot {
   placedAt: string;
 }
 
+/** 归还清点记录：每次归还清点留一条，账实不符时逐条累积 */
+export interface LoanReturnEntry {
+  /** 实际归还枚数 */
+  actualCount: number;
+  /** 账面应还枚数（清点时盘中落位数量） */
+  expectedCount: number;
+  /** 账实是否相符 */
+  matched: boolean;
+  /** 差异说明（账实不符时必填） */
+  note: string;
+  /** 清点时间 */
+  returnedAt: string;
+}
+
+/** 字盘外借登记（借给外单位展陈） */
+export interface CaseLoan {
+  /** 借用人 */
+  borrower: string;
+  /** 联系方式 */
+  contact: string;
+  /** 预计归还日 YYYY-MM-DD */
+  expectedReturn: string;
+  /** 借出时间 */
+  lentAt: string;
+  /** 借出时盘中落位数量（账面枚数） */
+  expectedCount: number;
+  /** 归还清点记录 */
+  returns: LoanReturnEntry[];
+}
+
 export interface TypeCase {
   id: string;
   /** 字盘编号，例：ZP-A-01 */
@@ -34,6 +64,10 @@ export interface TypeCase {
    * 由落位操作自动维护，与 slots 中的 matrixId 保持一致。
    */
   matrixId: string[];
+  /** 当前外借记录；null 表示在库（格位可编辑），借用中格位只读 */
+  loan: CaseLoan | null;
+  /** 已归还的历史外借记录 */
+  loanHistory: CaseLoan[];
   createdAt: string;
   updatedAt: string;
 }
@@ -72,4 +106,57 @@ export function validateCaseInput(input: Partial<CaseInput>): Record<string, str
 /** 字盘容量的文字描述 */
 export function describeCapacity(rows: number, cols: number): string {
   return `${rows} 行 × ${cols} 列 = ${capacityOf(rows, cols)} 格`;
+}
+
+/** 外借登记表单 */
+export interface LoanInput {
+  borrower: string;
+  contact: string;
+  expectedReturn: string;
+}
+
+/** 归还清点表单 */
+export interface ReturnInput {
+  actualCount: number;
+  note: string;
+}
+
+/** 本机今天，YYYY-MM-DD */
+function localToday(): string {
+  const d = new Date();
+  const m = `${d.getMonth() + 1}`.padStart(2, '0');
+  const day = `${d.getDate()}`.padStart(2, '0');
+  return `${d.getFullYear()}-${m}-${day}`;
+}
+
+/** 外借登记校验：借用人、联系方式、预计归还日必填 */
+export function validateLoanInput(input: Partial<LoanInput>): Record<string, string> {
+  const errors: Record<string, string> = {};
+  if (!(input.borrower || '').trim()) errors.borrower = '借用人不能为空';
+  if (!(input.contact || '').trim()) errors.contact = '联系方式不能为空';
+  const date = (input.expectedReturn || '').trim();
+  if (!date) {
+    errors.expectedReturn = '请选择预计归还日';
+  } else if (Number.isNaN(new Date(`${date}T00:00:00`).getTime())) {
+    errors.expectedReturn = '预计归还日格式不正确';
+  } else if (date < localToday()) {
+    errors.expectedReturn = '预计归还日不能早于今天';
+  }
+  return errors;
+}
+
+/** 归还清点校验：expectedCount 为盘中落位数量（账面枚数），账实不符时差异说明必填 */
+export function validateReturnInput(
+  input: { actualCount: number | string; note?: string },
+  expectedCount: number,
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  const raw = typeof input.actualCount === 'string' ? input.actualCount.trim() : input.actualCount;
+  const n = raw === '' || raw === undefined || raw === null ? Number.NaN : Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    errors.actualCount = '实际枚数需为不小于 0 的整数';
+  } else if (n !== expectedCount && !(input.note || '').trim()) {
+    errors.note = `实还 ${n} 枚与账面 ${expectedCount} 枚不符，请填写差异说明`;
+  }
+  return errors;
 }
